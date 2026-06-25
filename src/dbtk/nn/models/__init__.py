@@ -38,6 +38,10 @@ class DbtkModel(PreTrainedModel, L.LightningModule):
     # List of sub-model keys to instantiate
     sub_models: List[str] = []
 
+    @property
+    def all_tied_weights_keys(self):
+        return {}
+
     def __init__(self, config: Optional[Union[PretrainedConfig, dict]] = None):
         if config is None:
             config = self.config_class()
