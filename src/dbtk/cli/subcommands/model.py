@@ -15,7 +15,7 @@ import yaml
 from .._cli import CliSubCommand, subcommand
 from ..._utils import load_class
 from ...config import parse as parse_config
-from ...nn.callbacks import ConfigCheckpoint
+from ...nn.callbacks import ConfigCheckpoint, WandbResumeCallback
 from ...nn.models import DbtkModel
 
 @subcommand("config", "Generate a default configuration.")
@@ -166,6 +166,8 @@ class FitCommand(CliSubCommand):
                           help="Directory to save checkpoints and resume from")
         parser.add_argument("--config", "-c", type=Path, default=[], action="append",
                           help="Configuration files to merge with checkpoint config")
+        parser.add_argument("--reset-wandb", action="store_true", default=False,
+                          help="Start a new W&B run instead of resuming the one stored in the checkpoint")
 
     def run(self, args: argparse.Namespace) -> int:
         """
@@ -190,6 +192,13 @@ class FitCommand(CliSubCommand):
                     print(f"Loaded config from checkpoint: {last_ckpt}")
             except Exception as e:
                 print(f"Warning: Could not load config from checkpoint: {str(e)}", file=sys.stderr)
+
+        # Strip embedded W&B run ID so the next run starts fresh in wandb
+        if args.reset_wandb:
+            logger_raw = merged_config.get('train', {}).get('logger', {})
+            if isinstance(logger_raw, dict) and 'config' in logger_raw:
+                logger_raw['config'].pop('id', None)
+                logger_raw['config'].pop('resume', None)
 
         # Create checkpoint directory if it doesn't exist
         args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -252,12 +261,14 @@ class FitCommand(CliSubCommand):
 
         # Setup config checkpointing
         config_callback = ConfigCheckpoint(merged_config)
+        wandb_resume_callback = WandbResumeCallback(config_callback)
 
         # Add checkpoint callback to existing callbacks
         callbacks = trainer_config.pop('callbacks', []) or []
         callbacks.append(checkpoint_callback)
         callbacks.append(exception_callback)
         callbacks.append(config_callback)
+        callbacks.append(wandb_resume_callback)
         trainer_config['callbacks'] = callbacks
 
         # Enable automatic checkpointing
