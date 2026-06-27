@@ -297,6 +297,8 @@ class ExportCommand(CliSubCommand):
                           help="Path to the checkpoint file")
         parser.add_argument("output_dir", type=Path,
                           help="Directory to save the exported model")
+        parser.add_argument("--as-embedding", action="store_true", default=False,
+                          help="Strip the task head and export as an embedding model")
 
     def run(self, args: argparse.Namespace) -> int:
         """
@@ -339,6 +341,12 @@ class ExportCommand(CliSubCommand):
         # Remove 'model.' prefix from state dict keys if present
         state_dict = {k.replace('model.', ''): v for k, v in checkpoint['state_dict'].items()}
         model.load_state_dict(state_dict)
+
+        if args.as_embedding:
+            if not hasattr(model, "to_embedding_model"):
+                print(f"Error: {model.__class__.__name__} does not support --as-embedding", file=sys.stderr)
+                return 1
+            model = model.to_embedding_model()
 
         # Create output directory
         args.output_dir.mkdir(parents=True, exist_ok=True)
