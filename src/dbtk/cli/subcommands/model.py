@@ -14,7 +14,7 @@ import yaml
 
 from .._cli import CliSubCommand, subcommand
 from ..._utils import load_class
-from ...config import parse as parse_config
+from ...config import parse as parse_config, merge as merge_config
 from ...nn.callbacks import ConfigCheckpoint, WandbResumeCallback
 from ...nn.models import DbtkModel
 
@@ -221,8 +221,8 @@ class FitCommand(CliSubCommand):
                             print(f"Error: Unsupported config file format: {config_path}", file=sys.stderr)
                             return 1
 
-                    # Update merged_config with new config
-                    merged_config.update(config)
+                    # Deep-merge so nested sections (e.g. train) are patched, not replaced
+                    merge_config(merged_config, config)
                 except Exception as e:
                     print(f"Error loading config file {config_path}: {str(e)}", file=sys.stderr)
                     return 1
