@@ -353,5 +353,11 @@ class ExportCommand(CliSubCommand):
 
         # Save using HuggingFace format
         model.save_pretrained(args.output_dir)
+
+        # Write the training config alongside the exported model for provenance
+        run_config_path = args.output_dir / "run_config.yaml"
+        with open(run_config_path, "w") as f:
+            yaml.dump(checkpoint['config'], f, default_flow_style=False)
+
         print(f"Model exported to {args.output_dir}")
         return 0
