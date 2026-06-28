@@ -355,7 +355,7 @@ class ExportCommand(CliSubCommand):
         model.save_pretrained(args.output_dir)
 
         # Write the training config alongside the exported model for provenance
-        run_config_path = args.output_dir / "run_config.yaml"
+        run_config_path = args.output_dir / "dbtk_config.yaml"
         with open(run_config_path, "w") as f:
             yaml.dump(checkpoint['config'], f, default_flow_style=False)
 
