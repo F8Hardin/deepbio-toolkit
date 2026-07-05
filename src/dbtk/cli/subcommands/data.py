@@ -254,7 +254,7 @@ Output per dataset:
         import torch
         from dnadb import fasta, taxonomy
         from dnabert.models import DnaBertForTaxonomy
-        from dnabert.datamodules import DnaBertFastaPredictDataModule
+        from dnabert.datamodules import DnaBertSequencePredictDataModule
         from dbtk.config import load as load_config
 
         cfg = load_config(args.config)
@@ -305,34 +305,40 @@ Output per dataset:
                 continue
 
             print(f"\n[{dataset_name}] Running genus prediction...")
-            dm = DnaBertFastaPredictDataModule(
+            dm = DnaBertSequencePredictDataModule(
                 tokenizer=model.tokenizer,
                 sequences_path=fasta_db_path,
                 max_length=model.base.config.max_length,
                 batch_size=classifier.batch_size,
             )
             outputs = trainer.predict(model, datamodule=dm)
+            n_sequences = len(dm.dataset)
+            seq_id_to_idx = {seq_id: i for i, seq_id in enumerate(dm.dataset._ids)}
 
-            # Aggregate batch outputs into index and prediction tensors
-            local_indices = torch.cat([si for si, _ in outputs])
-            local_preds   = torch.cat([gp for _, gp in outputs])
+            local_seq_ids = []
+            local_preds   = []
+            for seq_ids, pred_ids, _, _ in outputs:
+                local_seq_ids.extend(seq_ids)
+                local_preds.append(pred_ids[:, -1])  # genus rank (last)
+            local_preds = torch.cat(local_preds)
 
             # Gather across DDP ranks onto rank 0; non-rank-0 processes skip mapping
             if trainer.world_size > 1:
                 import torch.distributed as dist
                 gathered = [None] * trainer.world_size
-                dist.all_gather_object(gathered, (local_indices, local_preds))
+                dist.all_gather_object(gathered, (local_seq_ids, local_preds))
                 if trainer.global_rank != 0:
                     continue
-                all_indices = torch.cat([g[0] for g in gathered])
+                all_seq_ids = [sid for g in gathered for sid in g[0]]
                 all_preds   = torch.cat([g[1] for g in gathered])
             else:
-                all_indices = local_indices
+                all_seq_ids = local_seq_ids
                 all_preds   = local_preds
 
-            # Rebuild a flat genus_preds array indexed by sequence index
-            genus_preds = np.empty(len(dm.dataset), dtype=np.int64)
-            genus_preds[all_indices.numpy()] = all_preds.numpy()
+            # Rebuild a flat genus_preds array indexed by sequence position
+            genus_preds = np.empty(n_sequences, dtype=np.int64)
+            for seq_id, pred in zip(all_seq_ids, all_preds.numpy()):
+                genus_preds[seq_id_to_idx[seq_id]] = pred
 
             print(f"[{dataset_name}] Generating reference mapping...")
             self._build_mapping(
