@@ -361,3 +361,156 @@ class ExportCommand(CliSubCommand):
 
         print(f"Model exported to {args.output_dir}")
         return 0
+
+
+@subcommand("predict", "Cache taxonomy predictions to disk for each dataset.")
+class PredictCommand(CliSubCommand):
+    _CONFIG_SCHEMA = """\
+Config schema (YAML):
+    classifier:
+      name: topdown-64d-250bp-1mer   # used in output filename: predictions.{name}.pt
+      model_path: /path/to/exported/model
+      batch_size: 256
+
+    datasets:
+      - name: my-dataset
+        path: /path/to/datasets/my-dataset
+
+    overwrite: false
+
+Output per dataset:
+    {dataset.path}/predictions.{classifier.name}.pt
+"""
+
+    @override
+    def configure(self, parser: argparse.ArgumentParser):
+        parser.formatter_class = argparse.RawDescriptionHelpFormatter
+        parser.epilog = self._CONFIG_SCHEMA
+        parser.add_argument("--config", type=Path, required=True, help="YAML config file.")
+        parser.add_argument("--overwrite", action="store_true", help="Overwrite existing prediction files.")
+        parser.add_argument("--top-k", type=int, default=5, help="K for top-k predictions stored (default: 5).")
+        parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers (default: 0).")
+
+    # Maps model_type (from config.json) to the fully-qualified class path.
+    # Add new taxonomy classifier types here.
+    _MODEL_TYPE_MAP = {
+        "dnabert_for_taxonomy":       "dnabert.models.DnaBertForTaxonomy",
+        "naive_bayes_for_taxonomy":   "dnabert.nb_models.NaiveBayesForTaxonomy",
+    }
+
+    @override
+    def run(self, args: argparse.Namespace) -> int:
+        import importlib
+        import lightning as L
+        import torch
+        from transformers import PretrainedConfig
+        from dbtk.config import load as load_config
+
+        cfg = load_config(args.config)
+        classifier = cfg["classifier"]
+        datasets = [(d["name"], Path(d["path"])) for d in cfg["datasets"]]
+        overwrite = args.overwrite or cfg.get("overwrite", False)
+        top_k = args.top_k
+
+        name       = classifier["name"]
+        model_path = Path(classifier["model_path"])
+        batch_size = classifier.get("batch_size", 256)
+
+        print(f"Classifier: {name}")
+        print(f"Loading model from {model_path}...")
+        config = PretrainedConfig.from_pretrained(str(model_path))
+        if config.model_type not in self._MODEL_TYPE_MAP:
+            print(
+                f"Error: unsupported model_type '{config.model_type}'. "
+                f"Supported: {list(self._MODEL_TYPE_MAP)}",
+                file=sys.stderr,
+            )
+            return 1
+        module_path, class_name = self._MODEL_TYPE_MAP[config.model_type].rsplit(".", 1)
+        model_class = getattr(importlib.import_module(module_path), class_name)
+        model = model_class.from_pretrained(model_path)
+        model._predict_top_k = top_k
+
+        train_id_to_taxon = [
+            sorted(set(label.strip() for label in labels))
+            for labels in model.config.rank_labels
+        ]
+
+        accelerator = classifier.get("accelerator", "auto")
+        devices     = classifier.get("devices",     "auto")
+        trainer = L.Trainer(
+            accelerator=accelerator,
+            devices=devices,
+            logger=False,
+            enable_model_summary=False,
+        )
+
+        for dataset_name, dataset_path in datasets:
+            output_path = dataset_path / f"predictions.{name}.pt"
+
+            if output_path.exists() and not overwrite:
+                print(f"\n[{dataset_name}] Already exists, skipping (use --overwrite to redo).")
+                continue
+
+            fasta_db_path = dataset_path / "sequences.fasta.db"
+            if not fasta_db_path.exists():
+                print(f"\n[{dataset_name}] Skipping: sequences.fasta.db not found.")
+                continue
+
+            print(f"\n[{dataset_name}] Running prediction...")
+            dm = model.create_datamodule(
+                sequences_path=fasta_db_path,
+                batch_size=batch_size,
+                num_workers=args.num_workers,
+            )
+            outputs = trainer.predict(model, datamodule=dm)
+
+            local_seq_ids = []
+            local_pred_ids, local_topk_ids, local_topk_scores = [], [], []
+            for seq_ids, pred_ids, topk_ids, topk_scores in outputs:
+                local_seq_ids.extend(seq_ids)
+                local_pred_ids.append(pred_ids)
+                local_topk_ids.append(topk_ids)
+                local_topk_scores.append(topk_scores)
+
+            all_pred_ids    = torch.cat(local_pred_ids)
+            all_topk_ids    = torch.cat(local_topk_ids)
+            all_topk_scores = torch.cat(local_topk_scores)
+
+            if trainer.world_size > 1:
+                import torch.distributed as dist
+                local_payload = (
+                    local_seq_ids,
+                    all_pred_ids.cpu(),
+                    all_topk_ids.cpu(),
+                    all_topk_scores.cpu(),
+                )
+                gathered = [None] * trainer.world_size
+                dist.all_gather_object(gathered, local_payload)
+                if trainer.global_rank != 0:
+                    continue
+                seq_lists, pred_list, topk_list, scores_list = zip(*gathered)
+                local_seq_ids   = [sid for sids in seq_lists for sid in sids]
+                all_pred_ids    = torch.cat(pred_list)
+                all_topk_ids    = torch.cat(topk_list)
+                all_topk_scores = torch.cat(scores_list)
+
+            payload = {
+                "seq_ids":           local_seq_ids,
+                "pred_ids":          all_pred_ids.cpu(),
+                "topk_ids":          all_topk_ids.cpu(),
+                "topk_scores":       all_topk_scores.cpu(),
+                "rank_labels":       model.config.rank_labels,
+                "parent_indices":    model.config.parent_indices,
+                "train_id_to_taxon": train_id_to_taxon,
+                "top_k":             top_k,
+                "model_path":        str(model_path),
+                "sequences_path":    str(fasta_db_path),
+            }
+
+            torch.save(payload, output_path)
+            n = len(local_seq_ids)
+            print(f"[{dataset_name}] Saved {n:,} predictions → {output_path}")
+
+        print("\nAll done.")
+        return 0

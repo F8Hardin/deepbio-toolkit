@@ -188,14 +188,10 @@ class GenerateMappings(CliSubCommand):
     _CONFIG_SCHEMA = """\
 Config schema (YAML):
     classifier:
-      class_path: dnabert.classifiers.DnaBertClassifier
-      config:
-        model_path: /path/to/model
-        batch_size: 256
-        name: topdown-64d        # used in output filename; defaults to head_type from model config
+      name: topdown-64d-250bp-1mer   # used in output filename; must match the name used in 'dbtk model predict'
 
     reference_dataset:
-      name: silva_nr99_filtered_515f_806r
+      name: silva-nr99-filtered-515f-806r
       path: /path/to/datasets/silva_nr99_filtered_515f_806r
 
     datasets:
@@ -205,8 +201,11 @@ Config schema (YAML):
     seed: 42
     overwrite: false
 
+Reads per dataset:
+    {dataset.path}/predictions.{classifier.name}.pt   (produced by 'dbtk model predict')
+
 Output per dataset:
-    {dataset.path}/sequences.{classifier.model_name}.{reference_dataset.name}.fasta.mapping.db
+    {dataset.path}/sequences.{classifier.name}.{reference_dataset.name}.fasta.mapping.db
 """
 
     @override
@@ -218,16 +217,20 @@ Output per dataset:
         parser.add_argument("--seed", type=int, default=None, help="Override random seed from config.")
 
     def _build_genus_index(self, tax_db) -> list:
-        """Return a list where index i holds all reference sequence indices for genus i."""
-        return [tax_db.sequence_indices_with_taxonomy_id(i) for i in range(tax_db.num_labels)]
+        """Return a list where index i holds all reference sequence indices for genus i (alpha/taxon_id order)."""
+        n_genera = len(tax_db.tree.id_to_taxon_map[-1])
+        genus_index = [[] for _ in range(n_genera)]
+        for node in tax_db.tree.taxonomy_id_map[-1]:
+            seqs = tax_db.sequence_indices_with_taxonomy_id(node.taxonomy_id)
+            genus_index[node.taxon_id].extend(seqs)
+        return genus_index
 
-    def _build_mapping(self, genus_preds, genus_index, dataset_path, output_path, ref_fasta_db, rng):
+    def _build_mapping(self, genus_preds, genus_index, dataset_path, output_path, ref_fasta_db, fasta_db, rng):
         """Build the LMDB reference mapping from pre-computed genus predictions (rank-0 only)."""
         from dnadb import fasta
 
-        real_fasta_db = fasta.FastaDb(dataset_path / "sequences.fasta.db")
-        real_samples = real_fasta_db.mappings(dataset_path / "sequences.fasta.mapping.db", load_into_memory=True)
-        print(f"  {len(real_samples)} samples, {len(real_fasta_db):,} unique sequences")
+        real_samples = fasta_db.mappings(dataset_path / "sequences.fasta.mapping.db", load_into_memory=True)
+        print(f"  {len(real_samples)} samples, {len(fasta_db):,} unique sequences")
 
         empty = sum(1 for gid in genus_preds if len(genus_index[gid]) == 0)
         if empty:
@@ -250,26 +253,21 @@ Output per dataset:
 
     @override
     def run(self, args: argparse.Namespace) -> int:
-        import lightning as L
         import torch
         from dnadb import fasta, taxonomy
-        from dnabert.models import DnaBertForTaxonomy
-        from dnabert.datamodules import DnaBertSequencePredictDataModule
         from dbtk.config import load as load_config
 
         cfg = load_config(args.config)
 
         classifier = cfg["classifier"]
+        name = classifier["name"]
         ref_name = cfg["reference_dataset"]["name"]
         ref_path = Path(cfg["reference_dataset"]["path"])
         datasets = [(d["name"], Path(d["path"])) for d in cfg["datasets"]]
         seed = args.seed if args.seed is not None else cfg.get("seed", 42)
         overwrite = args.overwrite or cfg.get("overwrite", False)
 
-        print(f"Classifier: {classifier.model_name}")
-        print("Loading model...")
-        model = DnaBertForTaxonomy.from_pretrained(classifier.model_path)
-
+        print(f"Classifier: {name}")
         print(f"Loading reference from {ref_path}...")
         ref_fasta_db = fasta.FastaDb(ref_path / "sequences.fasta.db")
         ref_tax_db = taxonomy.TaxonomyDb(
@@ -283,15 +281,8 @@ Output per dataset:
 
         rng = np.random.default_rng(seed)
 
-        trainer = L.Trainer(
-            accelerator="auto",
-            devices="auto",
-            logger=False,
-            enable_model_summary=False,
-        )
-
         for dataset_name, dataset_path in datasets:
-            output_name = f"sequences.{classifier.model_name}.{ref_name}.fasta.mapping.db"
+            output_name = f"sequences.{name}.{ref_name}.fasta.mapping.db"
             output_path = dataset_path / output_name
 
             if output_path.exists() and not overwrite:
@@ -300,44 +291,28 @@ Output per dataset:
 
             fasta_db_path = dataset_path / "sequences.fasta.db"
             mapping_db_path = dataset_path / "sequences.fasta.mapping.db"
+            pred_path = dataset_path / f"predictions.{name}.pt"
+
             if not fasta_db_path.exists() or not mapping_db_path.exists():
                 print(f"\n[{dataset_name}] Skipping: sequences.fasta.db or .mapping.db not found.")
                 continue
 
-            print(f"\n[{dataset_name}] Running genus prediction...")
-            dm = DnaBertSequencePredictDataModule(
-                tokenizer=model.tokenizer,
-                sequences_path=fasta_db_path,
-                max_length=model.base.config.max_length,
-                batch_size=classifier.batch_size,
-            )
-            outputs = trainer.predict(model, datamodule=dm)
-            n_sequences = len(dm.dataset)
-            seq_id_to_idx = {seq_id: i for i, seq_id in enumerate(dm.dataset._ids)}
+            if not pred_path.exists():
+                print(f"\n[{dataset_name}] Skipping: {pred_path.name} not found. "
+                      f"Run 'dbtk model predict' first.")
+                continue
 
-            local_seq_ids = []
-            local_preds   = []
-            for seq_ids, pred_ids, _, _ in outputs:
-                local_seq_ids.extend(seq_ids)
-                local_preds.append(pred_ids[:, -1])  # genus rank (last)
-            local_preds = torch.cat(local_preds)
+            print(f"\n[{dataset_name}] Loading predictions from {pred_path.name}...")
+            payload = torch.load(pred_path, weights_only=False)
+            all_seq_ids   = payload["seq_ids"]
+            all_genus_ids = payload["pred_ids"][:, -1]  # genus = last rank
 
-            # Gather across DDP ranks onto rank 0; non-rank-0 processes skip mapping
-            if trainer.world_size > 1:
-                import torch.distributed as dist
-                gathered = [None] * trainer.world_size
-                dist.all_gather_object(gathered, (local_seq_ids, local_preds))
-                if trainer.global_rank != 0:
-                    continue
-                all_seq_ids = [sid for g in gathered for sid in g[0]]
-                all_preds   = torch.cat([g[1] for g in gathered])
-            else:
-                all_seq_ids = local_seq_ids
-                all_preds   = local_preds
-
-            # Rebuild a flat genus_preds array indexed by sequence position
+            # Reindex predictions by sequence position in the FASTA DB
+            fasta_db = fasta.FastaDb(fasta_db_path)
+            n_sequences = len(fasta_db)
+            seq_id_to_idx = {entry.identifier: i for i, entry in enumerate(fasta_db)}
             genus_preds = np.empty(n_sequences, dtype=np.int64)
-            for seq_id, pred in zip(all_seq_ids, all_preds.numpy()):
+            for seq_id, pred in zip(all_seq_ids, all_genus_ids.numpy()):
                 genus_preds[seq_id_to_idx[seq_id]] = pred
 
             print(f"[{dataset_name}] Generating reference mapping...")
@@ -347,8 +322,10 @@ Output per dataset:
                 dataset_path=dataset_path,
                 output_path=output_path,
                 ref_fasta_db=ref_fasta_db,
+                fasta_db=fasta_db,
                 rng=rng,
             )
+            fasta_db.close()
             print(f"[{dataset_name}] Written to {output_path}")
 
         print("\nAll done.")
