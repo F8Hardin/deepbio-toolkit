@@ -965,6 +965,14 @@ class BiMamba3Block(nn.Module):
     def embed_dim(self) -> int:
         return self.forward_mamba.d_model
 
+    @property
+    def is_mimo(self) -> bool:
+        return self.forward_mamba.is_mimo
+
+    @property
+    def chunk_size(self) -> int:
+        return self.forward_mamba.chunk_size
+
 
 class Mamba3Encoder(nn.Module):
 
@@ -975,13 +983,25 @@ class Mamba3Encoder(nn.Module):
         final_layer_norm: bool = False
     ):
         super().__init__()
+        self.is_mimo = encoder_layer.is_mimo
+        self.chunk_size = encoder_layer.chunk_size
         self.layers = nn.ModuleList([copy.deepcopy(encoder_layer) for _ in range(num_layers)])
         self.norm = nn.LayerNorm(encoder_layer.embed_dim) if final_layer_norm else nn.Identity()
 
     def forward(self, src: torch.Tensor, **kwargs):
+        seq_length = src.shape[-2]
+        if self.is_mimo:
+            pad_size = (-seq_length) % self.chunk_size
+            if pad_size != 0:
+                src = F.pad(src, (0, 0, 0, pad_size))
+
         output = src
         for layer in self.layers:
             output = layer(output)
+
+        if output.shape[-2] != seq_length:
+            output = output[:, :seq_length, :]
+
         return self.norm(output)
 
     @property
